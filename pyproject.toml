@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyp-challenge-tutorial"
+version = "0.1.0"
+description = "Tutorial for the OpenADMET CYP Challenge"
+readme = "README.md"
+license = {text = "LICENSE"}
+authors = [
+    {name = "Maria Castellanos"},
+]
+requires-python = ">=3.8"
+dependencies = [
+    "click>=8.1.0",
+    "pandas>=1.0.0",
+    "numpy>=1.19.0",
+    "rdkit>=2021.03.0",
+    "matplotlib>=3.3.0",
+    "seaborn>=0.11.0",
+]
+
+[project.optional-dependencies]
+notebook = [
+    "jupyter>=1.0.0",
+    "jupyterlab>=3.0.0",
+    "plotly>=4.14.0",
+    "tqdm>=4.60.0",
+    "gradio-client>=0.13.0",
+    "huggingface-hub>=0.18.0",
+]
+dev = [
+    "pytest>=6.0.0",
+    "pytest-cov>=2.12.0",
+    "black>=21.0",
+    "flake8>=3.9.0",
+    "mypy>=0.910",
+]
+
+[project.scripts]
+validate-submission = "validation.cli:validate_submission"
+
+[tool.setuptools]
+packages = ["validation"]
+
+[tool.setuptools.package-data]
+validation = ["*.py"]
