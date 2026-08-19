@@ -1,77 +1,74 @@
-"""Configuration file for the OpenADMET CYP blind challenge."""
+"""Configuration file for the OpenADMET CYP blind challenge.
 
-import numpy as np
+Ported from the challenge backend, so it should match exactly what you see on the leaderboard!
+"""
+
+from functools import partial
+
 from scipy.stats import kendalltau, spearmanr
 from sklearn.metrics import (
     accuracy_score,
-    balanced_accuracy_score,
     f1_score,
-    mean_absolute_error,
     matthews_corrcoef,
+    mean_absolute_error,
+    precision_score,
     r2_score,
-    roc_auc_score,
+    recall_score,
 )
 
+from .custom_scoring_functions import rae_soft_threshold_absolute_error
 
-def rae(y_true, y_pred):
-    """Relative absolute error (RAE) metric for regression tasks."""
-    return np.sum(np.abs(y_true - y_pred)) / np.sum(np.abs(y_true - np.mean(y_true)))
-
-
-def _binarize(y_pred_proba, threshold: float = 0.5):
-    """Threshold predicted TDI probabilities into hard class labels."""
-    return (np.asarray(y_pred_proba) >= threshold).astype(int)
-
-
-def accuracy_from_proba(y_true, y_pred_proba):
-    """Accuracy of the TDI classifier after thresholding probabilities at 0.5."""
-    return accuracy_score(y_true, _binarize(y_pred_proba))
-
-
-def balanced_accuracy_from_proba(y_true, y_pred_proba):
-    """Balanced accuracy of the TDI classifier after thresholding probabilities at 0.5."""
-    return balanced_accuracy_score(y_true, _binarize(y_pred_proba))
-
-
-def f1_from_proba(y_true, y_pred_proba):
-    """F1 score of the TDI classifier after thresholding probabilities at 0.5."""
-    return f1_score(y_true, _binarize(y_pred_proba))
-
-
-def mcc_from_proba(y_true, y_pred_proba):
-    """Matthews correlation coefficient after thresholding probabilities at 0.5."""
-    return matthews_corrcoef(y_true, _binarize(y_pred_proba))
-
-
-def roc_auc_safe(y_true, y_pred_proba):
-    """ROC-AUC of the predicted TDI probabilities.
-
-    Returns NaN if the bootstrap sample only contains one class, since
-    ROC-AUC is undefined in that case.
-    """
-    if len(np.unique(y_true)) < 2:
-        return np.nan
-    return roc_auc_score(y_true, y_pred_proba)
-
+# Multi-endpoint macro-averaging .
+# A pseudo-endpoint, scored alongside the real endpoints in every bootstrap sample, whose
+# per-metric values are macro-averages across endpoints rather than raw per-endpoint scores.
+MACRO_ENDPOINT_LABEL = "MA"
 
 # Activity dataset
-ENDPOINTS = ["pEC50"]
+IDENTIFIER_COLUMNS = ["SMILES", "Molecule_Name"]
+REGRESSION_ENDPOINTS = [
+    "CYP1A2_pIC50_direct_inhibition",
+    "CYP2C9_pIC50_direct_inhibition",
+    "CYP2D6_pIC50_direct_inhibition",
+    "CYP3A4_pIC50_direct_inhibition",
+]
+REGRESSION_CREDIBLE_INTERVALS_UPPER_SUFFIX = "_conf_high"
+REGRESSION_CREDIBLE_INTERVALS_LOWER_SUFFIX = "_conf_low"
+# Leave list empty if no classification tasks
+CLASSIFICATION_ENDPOINTS = [
+    "CYP2D6_is_TDI",
+    "CYP3A4_is_TDI",
+]
+ACTIVITY_ENDPOINTS = REGRESSION_ENDPOINTS + CLASSIFICATION_ENDPOINTS
 ENDPOINTS_TO_LOG_TRANSFORM: list[str] = []
+ACTIVITY_DATASET_SIZE = 750
 ACTIVITY_METRICS = [
+    ("ST-RAE", rae_soft_threshold_absolute_error),
     ("MAE", mean_absolute_error),
-    ("RAE", rae),
     ("R2", r2_score),
-    ("Spearman R", spearmanr),
-    ("Kendall's Tau", kendalltau),
+    ("Spearman_R", spearmanr),
+    ("Kendall_Tau", kendalltau),
 ]
+# Rank correlations (Spearman_R, Kendall_Tau) are mathematically undefined  
+# whenever a bootstrap sample has zero variance in
+# y_pred (e.g. a submission that predicts the same value for every compound) or y_true. 
+# 0.0 is the "no correlation" value on both metrics' [-1, 1] scale, matching how an
+# unconditionally-constant predictor should be scored: no better than chance, not a
+# hard failure. 
+METRIC_NAN_FALLBACK: dict[str, float] = {
+    "Spearman_R": 0.0,
+    "Kendall_Tau": 0.0,
+}
+# zero_division=0 matches sklearn's documented degenerate-case default, avoiding
+# warnings/errors on bootstrap resamples with no positive predictions (TDI labels are
+# imbalanced). matthews_corrcoef already returns 0.0 (not NaN) in its own degenerate
+# case, so it needs no wrapping.
+CLASSIFICATION_METRICS = [
+    ("MCC", matthews_corrcoef),
+    ("Accuracy", accuracy_score),
+    ("Precision", partial(precision_score, zero_division=0)),
+    ("Recall", partial(recall_score, zero_division=0)),
+    ("F1", partial(f1_score, zero_division=0)),
+]
+SORT_REGRESSION_LEADERBOARD_BY = "ST-RAE"
+SORT_CLASSIFICATION_LEADERBOARD_BY = "MCC"
 BOOTSTRAP_SAMPLES = 1000
-
-# TDI (time-dependent inhibition) classification dataset
-TDI_ENDPOINT = "is_TDI"
-TDI_METRICS = [
-    ("Accuracy", accuracy_from_proba),
-    ("Balanced Accuracy", balanced_accuracy_from_proba),
-    ("F1", f1_from_proba),
-    ("MCC", mcc_from_proba),
-    ("ROC-AUC", roc_auc_safe),
-]
