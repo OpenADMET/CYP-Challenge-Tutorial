@@ -29,6 +29,8 @@ notebook = [
     "tqdm>=4.60.0",
     "gradio-client>=0.13.0",
     "huggingface-hub>=0.18.0",
+    "MDAnalysis>=2.0.0",
+    "biotite>=0.35.0",
 ]
 dev = [
     "pytest>=6.0.0",
