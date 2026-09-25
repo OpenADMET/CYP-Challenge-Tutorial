@@ -1,7 +1,4 @@
-"""Functions for evaluating the predictions of the OpenADMET CYP blind challenge.
-
-Ported from the challenge backend, so it should match exactly what you see on the leaderboard!
-"""
+"""Functions for evaluating the predictions of the OpenADMET CYP blind challenge."""
 
 import inspect
 from typing import Callable
@@ -12,21 +9,25 @@ from loguru import logger
 
 from .config import (
     ACTIVITY_METRICS,
+    BISYRMSD_NAN_PENALTY,
     BOOTSTRAP_SAMPLES,
     CLASSIFICATION_ENDPOINTS,
     CLASSIFICATION_METRICS,
     ENDPOINTS_TO_LOG_TRANSFORM,
     MACRO_ENDPOINT_LABEL,
     METRIC_NAN_FALLBACK,
+    POSEBUSTERS_MAX_FAILURES,
     REGRESSION_CREDIBLE_INTERVALS_LOWER_SUFFIX,
     REGRESSION_CREDIBLE_INTERVALS_UPPER_SUFFIX,
+    STRUCTURE_METRICS,
 )
 from .utils import bootstrap_sampling, clip_and_log_transform
 
+# Residue names treated as solvent — excluded from ligand detection
+_SOLVENT_RESIDUE_NAMES: frozenset[str] = frozenset({"HOH", "WAT", "DOD"})
 
-# ---------------------------------------------------------------------------
-# Activity scoring
-# ---------------------------------------------------------------------------
+# Sentinel returned when a per-compound structure score cannot be computed
+_NAN_STRUCTURE_METRICS: dict[str, float] = {m: np.nan for m in STRUCTURE_METRICS}
 
 
 def _metrics_for_endpoint(endpoint: str) -> list[tuple[str, Callable]]:
@@ -36,7 +37,11 @@ def _metrics_for_endpoint(endpoint: str) -> list[tuple[str, Callable]]:
     (MCC/Accuracy/Precision/Recall/F1); every other activity endpoint (regression,
     direct-inhibition pIC50) is scored with ``ACTIVITY_METRICS``.
     """
-    return CLASSIFICATION_METRICS if endpoint in CLASSIFICATION_ENDPOINTS else ACTIVITY_METRICS
+    return (
+        CLASSIFICATION_METRICS
+        if endpoint in CLASSIFICATION_ENDPOINTS
+        else ACTIVITY_METRICS
+    )
 
 
 def score_activity_predictions(
@@ -291,7 +296,8 @@ def pivot_endpoint_results_wide(by_endpoint_results: pd.DataFrame) -> pd.DataFra
     ``"CYP3A4_pIC50_active_MAE_mean"``, ``"MA_ST-RAE_mean"``).
 
     A leaderboard for any single endpoint (macro or real) is then built by narrowing
-    back down to that endpoint's columns and stripping the prefix, so ``primary_metric``
+    back down to that endpoint's columns and stripping the prefix — see
+    ``aws_leaderboards._narrow_averaged_results_to_endpoint`` — so ``primary_metric``
     is always a bare metric name (e.g. ``"ST-RAE"``) regardless of which endpoint a
     given leaderboard targets.
 
@@ -439,3 +445,548 @@ def bootstrap_metrics(
 
     bootstrap_df = pd.DataFrame(bootstrap_metrics_list)
     return bootstrap_df
+
+
+# ---------------------------------------------------------------------------
+# Structure scoring
+# ---------------------------------------------------------------------------
+
+
+def score_single_structure(
+    model_path: str,
+    ref_path: str,
+    max_pb_failures: int = POSEBUSTERS_MAX_FAILURES,
+    smiles: str | None = None,
+) -> tuple[dict[str, float], list[str]]:
+    """Score one predicted protein-ligand complex PDB against the reference.
+
+    Runs SCRMSDScorer (BiSyRMSD + LDDT-LP) and LDDTPLIScorer (LDDT-PLI) and
+    returns the top-scoring ligand pair ranked by LDDT-PLI then BiSyRMSD.
+
+    When ``smiles`` is available, the ligands handed to both scorers are built
+    from it (``posebusters_utils.bonded_ligand_molblocks``, each copy loaded
+    via ``ost.io.SDFStrToEntity``) instead of a plain residue selection on the
+    PDB. OST falls back to guessing bonds from interatomic distance for any
+    residue not in its compound library (true for a custom ``LIG``), and two
+    independently posed copies of the same molecule (the ground-truth crystal
+    pose and a structure-prediction model's pose) can end up with genuinely
+    different guessed bond graphs — a borderline distance, such as a
+    transannular contact in a strained ring, falls on opposite sides of the
+    bonding cutoff in the two conformations — which makes ligand matching
+    fail outright with no assignment found even when both poses are the
+    correct compound. Building both ligands from the same SMILES sidesteps
+    that. When either side's complex genuinely contains more than one copy of
+    the ligand (e.g. symmetry mates, multiple binding sites), every copy is
+    bond-order assigned and handed to the scorers as its own entity (chain
+    renamed per copy so the reconciliation keys below stay distinct) — the
+    existing best-pair selection then picks whichever pairing scores best.
+    Falls back to OST's own residue selection (and its multiple-copy guard)
+    when no SMILES is given or bond-order assignment fails for every copy on
+    either side.
+
+    Also runs PoseBusters (dock config) on the predicted ligand pose, against
+    the protein from the *predicted* complex so both are in the same
+    coordinate frame. PoseBusters validates a pose, not a (ref, model)
+    pairing, so — when SMILES is available — it's run once per *distinct*
+    model copy that appears among the candidate pairings (memoized), and each
+    pairing's scores are overridden to worst-case (LDDT-PLI=0, LDDT-LP=0,
+    BiSyRMSD=``BISYRMSD_NAN_PENALTY``) if *that specific copy* fails more than
+    ``max_pb_failures`` checks — this happens *before* picking the best pair,
+    so an invalid copy can't win the sort just because its OST scores looked
+    good, and a valid copy isn't wrongly zeroed out by some other copy's
+    failure. In the naive-fallback path (no SMILES, or bond-order assignment
+    failed for every copy), there's no per-copy bonded ligand to check
+    individually, so PoseBusters instead validates one dedupe-picked
+    representative copy (see ``posebusters_utils.dedupe_ligand_copies``)
+    against the overall best pair, as this function has always done in that
+    case. Bond orders are recovered from ``smiles`` when provided via
+    ``posebusters_utils.assign_bond_orders_from_template`` (RDKit's PDB parser
+    leaves every bond single, which breaks geometry and energy checks; the
+    plain ``AllChem.AssignBondOrdersFromTemplate`` is not used directly
+    because it only tries the first topological match, which can raise a
+    spurious valence error or silently mis-assign a locally symmetric ring —
+    see that function's docstring).
+    Returns NaN for every metric if scoring fails for any reason, so that a
+    single bad submission file does not abort the full evaluation.
+
+    Args:
+        model_path (str): Filesystem path to the predicted complex PDB file.
+        ref_path (str): Filesystem path to the reference complex PDB file.
+        max_pb_failures (int): Maximum number of PoseBusters checks the predicted
+            ligand may fail before its scores are zeroed. Defaults to
+            ``POSEBUSTERS_MAX_FAILURES``.
+        smiles (str | None): Ground-truth SMILES for the ligand, used to build
+            an unambiguous ligand for OST's scorers and to assign correct bond
+            orders before running PoseBusters. When ``None``, OST guesses
+            ligand connectivity from distance and PoseBusters leaves bond
+            orders as parsed (all single), either of which may cause false
+            failures.
+
+    Returns:
+        tuple[dict[str, float], list[str]]: A pair of (scores, failed_pb_checks).
+            ``scores`` maps metric name to value (keys: ``LDDT-PLI``, ``BiSyRMSD``,
+            ``LDDT-LP``); any metric that cannot be computed is ``np.nan``.
+            ``failed_pb_checks`` is the sorted list of PoseBusters check names that
+            failed when the failure count exceeds ``max_pb_failures``; empty when the
+            pose passes, when PoseBusters is skipped due to parse errors, or when
+            scoring fails entirely.
+
+    """
+    try:
+        from ost import io  # type: ignore[import]
+        from ost.mol.alg.ligand_scoring import (  # type: ignore[import]
+            LDDTPLIScorer,
+            SCRMSDScorer,
+        )
+        from ost.mol.alg.scoring_base import PDBPrep  # type: ignore[import]
+        from rdkit import Chem
+
+        from .posebusters_utils import bonded_ligand_copies
+
+        # fault_tolerant=True allows loading PDBs with minor format issues
+        # (missing atoms, non-standard records) that are common in docking output.
+        model = PDBPrep(model_path, fault_tolerant=True)
+        ref = PDBPrep(ref_path, fault_tolerant=True)
+
+        # Prefer ligands with bond orders assigned from the ground-truth SMILES
+        # (see bonded_ligand_copies) over OST's own distance-based guessing,
+        # since two independently posed copies of the same molecule can end up
+        # with genuinely different guessed bond graphs and make ligand matching
+        # fail outright. Every copy on each side is bond-order assigned and
+        # passed as its own entity (LigandScorer expands each list item's
+        # residues internally, so a list of single-ligand entities works the
+        # same as a list of multi-residue selections). Two independently
+        # loaded SDF entities both default to the same chain/residue-number
+        # identity, which would collide in the chain.residue_number
+        # reconciliation keys below — renamed per copy to keep them distinct.
+        # model_key_to_model_copy remembers which all-atom RDKit Mol (still
+        # carrying its bond orders) backed each OST entity, keyed the same way
+        # as the reconciliation below, so PoseBusters can later be run against
+        # the *actual* copy a given pairing used — see the PoseBusters section.
+        # Falls back to OST's naive residue selection when no SMILES is
+        # available or bond-order assignment fails for every copy on either
+        # side; in that fallback, model_key_to_model_copy stays empty.
+        model_ligs: list = []
+        ref_ligs: list = []
+        model_key_to_model_copy: dict[str, Chem.Mol] = {}
+        if smiles is not None:
+            model_copies = bonded_ligand_copies(model_path, smiles)
+            ref_copies = bonded_ligand_copies(ref_path, smiles)
+            if model_copies and ref_copies:
+                for i, copy in enumerate(model_copies):
+                    ent = io.SDFStrToEntity(Chem.MolToMolBlock(Chem.RemoveHs(copy)))
+                    ent.EditXCS().RenameChain(ent.chains[0], f"LIG{i}")
+                    model_ligs.append(ent)
+                    residue = ent.residues[0]
+                    model_key_to_model_copy[
+                        f"{residue.chain.name}.{residue.number}"
+                    ] = copy
+                for i, copy in enumerate(ref_copies):
+                    ent = io.SDFStrToEntity(Chem.MolToMolBlock(Chem.RemoveHs(copy)))
+                    ent.EditXCS().RenameChain(ent.chains[0], f"LIG{i}")
+                    ref_ligs.append(ent)
+
+        if not model_ligs or not ref_ligs:
+            # Select only heavy atoms of the LIG residue. Hydrogens are excluded
+            # because protonation state varies between docking programs and
+            # crystal structures and would cause spurious subgraph isomorphism
+            # failures.
+            model_ligs = [model.Select("rname=LIG and ele!=H")]
+            ref_ligs = [ref.Select("rname=LIG and ele!=H")]
+
+            n_model_ligs = len(model_ligs[0].residues)
+            if n_model_ligs > 2:
+                logger.warning(
+                    "Model {} contains {} LIG residues (expected at most 2)"
+                    " — returning NaN scores.",
+                    model_path,
+                    n_model_ligs,
+                )
+                return dict(_NAN_STRUCTURE_METRICS), []
+
+        logger.info("Scoring structure {} against reference {}", model_path, ref_path)
+
+        # substructure_match=True allows the model ligand to be a subgraph of
+        # the reference (handles partial docking output). coverage_delta=0.1
+        # permits up to 10% atom coverage difference before the pair is
+        # considered unmatchable.
+        scrmsd_sc = SCRMSDScorer(
+            model=model,
+            target=ref,
+            model_ligands=model_ligs,
+            target_ligands=ref_ligs,
+            substructure_match=True,
+            coverage_delta=0.1,
+        )
+        lddt_pli_sc = LDDTPLIScorer(
+            model=model,
+            target=ref,
+            model_ligands=model_ligs,
+            target_ligands=ref_ligs,
+            substructure_match=True,
+            coverage_delta=0.1,
+        )
+
+        # Each scorer solves the protein chain mapping and ligand assignment
+        # problem independently. Integer indices are NOT comparable across
+        # scorers for structures with multiple equivalent ligand copies.
+        # Use "chain.residue_number" string keys as stable ligand identifiers
+        # and join post-hoc.
+        def _lig_key(lig: object) -> str:
+            return f"{lig.chain.name}.{lig.number}"  # type: ignore[attr-defined]
+
+        pli_ref_keys = [_lig_key(l) for l in lddt_pli_sc.target_ligands]
+        pli_mdl_keys = [_lig_key(l) for l in lddt_pli_sc.model_ligands]
+        sc_ref_keys = [_lig_key(l) for l in scrmsd_sc.target_ligands]
+        sc_mdl_keys = [_lig_key(l) for l in scrmsd_sc.model_ligands]
+
+        # LDDT-PLI assignment is the primary source of truth for which
+        # (ref ligand, model ligand) pairs to report.
+        results = []
+        for pli_i, pli_j in lddt_pli_sc.assignment:
+            ref_key = pli_ref_keys[pli_i]
+            mdl_key = pli_mdl_keys[pli_j]
+
+            if ref_key not in sc_ref_keys or mdl_key not in sc_mdl_keys:
+                logger.warning(
+                    "LDDT-PLI pair ({}, {}) not found in SCRMSDScorer ligand lists"
+                    " for {} — skipping pair.",
+                    ref_key,
+                    mdl_key,
+                    model_path,
+                )
+                continue
+            sc_i = sc_ref_keys.index(ref_key)
+            sc_j = sc_mdl_keys.index(mdl_key)
+
+            # state_matrix encodes why a given (ref, model) pair could not be
+            # scored. State 0 means the score is valid.
+            if scrmsd_sc.state_matrix[sc_i, sc_j] != 0:
+                state = scrmsd_sc.state_matrix[sc_i, sc_j]
+                decoding = scrmsd_sc.state_decoding[state]
+                logger.warning(
+                    "SCRMSDScorer state for ({}, {}) is {} ({}) —"
+                    " BiSyRMSD/LDDT-LP will be NaN.",
+                    ref_key,
+                    mdl_key,
+                    state,
+                    decoding,
+                )
+                results.append(
+                    {
+                        "LDDT-PLI": np.float64(lddt_pli_sc.score_matrix[pli_i, pli_j]),
+                        "BiSyRMSD": np.nan,
+                        "LDDT-LP": np.nan,
+                        "_model_copy": model_key_to_model_copy.get(mdl_key),
+                    }
+                )
+            else:
+                aux = scrmsd_sc.aux_matrix[sc_i, sc_j]
+                results.append(
+                    {
+                        "LDDT-PLI": np.float64(lddt_pli_sc.score_matrix[pli_i, pli_j]),
+                        "BiSyRMSD": np.float64(scrmsd_sc.score_matrix[sc_i, sc_j]),
+                        "LDDT-LP": np.float64(aux["lddt_lp"]),
+                        "_model_copy": model_key_to_model_copy.get(mdl_key),
+                    }
+                )
+
+        if not results:
+            logger.warning(
+                "No ligand assignment found between {} and {} — returning NaN scores."
+                " LDDT-PLI assignment: {}. SCRMSDScorer assignment: {}.",
+                model_path,
+                ref_path,
+                lddt_pli_sc.assignment,
+                scrmsd_sc.assignment,
+            )
+            return dict(_NAN_STRUCTURE_METRICS), []
+
+        from posebusters import PoseBusters  # type: ignore[import]
+
+        from .posebusters_utils import (
+            assign_bond_orders_from_template,
+            dedupe_ligand_copies,
+        )
+
+        # PoseBusters checks physical/geometric validity of *one* predicted
+        # ligand pose against the *predicted* receptor (it never touches the
+        # reference), so it's a property of a model copy, not of a
+        # (ref, model) pairing — run it once per distinct model copy that
+        # appears in `results` (memoized by object identity) and apply the
+        # worst-case override to every pairing using that copy, *before*
+        # picking the best pair. This is what makes an invalid copy lose the
+        # sort on its own merits, rather than best_result being chosen first
+        # and then checked against a possibly-different, arbitrarily-picked
+        # copy (which could wrongly validate an invalid winner, or wrongly
+        # zero out a valid one because some other copy failed).
+        pred_mol = Chem.MolFromPDBFile(model_path, removeHs=False, sanitize=False)
+        pb_protein = None
+        if pred_mol is not None:
+            fragments = Chem.SplitMolByPDBResidues(pred_mol)
+            fragments.pop("LIG", None)
+            for frag in fragments.values():
+                pb_protein = (
+                    frag if pb_protein is None else Chem.CombineMols(pb_protein, frag)
+                )
+
+        def _posebusters_failed_checks(ligand: Chem.Mol) -> list[str]:
+            template = Chem.MolFromSmiles(smiles) if smiles is not None else None
+            pb_sc = PoseBusters(config="dock")
+            pb_result = pb_sc.bust(
+                mol_pred=ligand, mol_true=template, mol_cond=pb_protein
+            )
+            pb_bool_cols = [c for c in pb_result.columns if pb_result[c].dtype == bool]
+            row = pb_result[pb_bool_cols].iloc[0]
+            return sorted(row.index[~row].tolist())
+
+        if pred_mol is None or pb_protein is None:
+            logger.warning(
+                "RDKit could not parse {} (or find its protein) for PoseBusters —"
+                " skipping check, returning OST scores.",
+                model_path,
+            )
+            for r in results:
+                r.pop("_model_copy", None)
+            results.sort(key=lambda r: (-r["LDDT-PLI"], r["BiSyRMSD"]))
+            return results[0], []
+
+        if any(r["_model_copy"] is not None for r in results):
+            # SMILES-available path: every pairing already knows exactly which
+            # bonded model copy it used (see model_key_to_model_copy above).
+            pb_cache: dict[int, list[str]] = {}
+            for r in results:
+                copy = r.pop("_model_copy")
+                if copy is None:
+                    continue
+                failed_checks = pb_cache.setdefault(
+                    id(copy), _posebusters_failed_checks(copy)
+                )
+                if len(failed_checks) > max_pb_failures:
+                    logger.warning(
+                        "Model {} copy failed {} PoseBusters checks (max allowed {})"
+                        " — zeroing that pairing's scores.",
+                        model_path,
+                        len(failed_checks),
+                        max_pb_failures,
+                    )
+                    r["LDDT-PLI"] = 0.0
+                    r["BiSyRMSD"] = BISYRMSD_NAN_PENALTY
+                    r["LDDT-LP"] = 0.0
+                r["_pb_failures"] = failed_checks
+            results.sort(key=lambda r: (-r["LDDT-PLI"], r["BiSyRMSD"]))
+            best_result = results[0]
+            failed_checks = best_result.pop("_pb_failures")
+            return best_result, failed_checks if len(
+                failed_checks
+            ) > max_pb_failures else []
+
+        # Naive-fallback path (no SMILES, or bond-order assignment failed for
+        # every copy): no per-copy bonded Mols exist to check individually, so
+        # fall back to a single dedupe-based check against the overall best
+        # pair — the same behavior this function has always had for this case.
+        for r in results:
+            r.pop("_model_copy", None)
+        results.sort(key=lambda r: (-r["LDDT-PLI"], r["BiSyRMSD"]))
+        best_result = results[0]
+
+        pb_ligand = Chem.SplitMolByPDBResidues(pred_mol).get("LIG")
+        if pb_ligand is None:
+            logger.warning(
+                "No LIG residue in {} for PoseBusters — skipping check, returning OST scores.",
+                model_path,
+            )
+            return best_result, []
+        pb_ligand = dedupe_ligand_copies(pb_ligand)
+        if smiles is not None:
+            template = Chem.MolFromSmiles(smiles)
+            if template is not None:
+                try:
+                    pb_ligand = assign_bond_orders_from_template(template, pb_ligand)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Bond order assignment failed for {} ({}) — PoseBusters will use single-bond ligand.",
+                        model_path,
+                        exc,
+                    )
+
+        failed_checks = _posebusters_failed_checks(pb_ligand)
+        if len(failed_checks) > max_pb_failures:
+            logger.warning(
+                "Model {} failed {} PoseBusters checks (max allowed {}) — zeroing scores.",
+                model_path,
+                len(failed_checks),
+                max_pb_failures,
+            )
+            return {
+                "LDDT-PLI": 0.0,
+                "BiSyRMSD": BISYRMSD_NAN_PENALTY,
+                "LDDT-LP": 0.0,
+            }, failed_checks
+        return best_result, []
+
+    except Exception as e:  # noqa: BLE001
+        logger.exception("OST scoring failed for {} vs {}: {}", model_path, ref_path, e)
+        return dict(_NAN_STRUCTURE_METRICS), []
+
+
+def dummy_score_single_structure(
+    model_path: str, ref_path: str
+) -> tuple[dict[str, float], list[str]]:
+    """Dummy scoring function that returns random scores for testing."""
+    import random
+
+    return {
+        "LDDT-PLI": random.uniform(0, 1),
+        "BiSyRMSD": random.uniform(0, 5),
+        "LDDT-LP": random.uniform(0, 1),
+    }, []
+
+
+def score_structure_predictions(
+    predicted_structures: dict[str, str],
+    ground_truth_structures: dict[str, str],
+    max_pb_failures: int = POSEBUSTERS_MAX_FAILURES,
+    smiles_map: pd.DataFrame | dict[str, str] | None = None,
+    id_column: str = "Molecule_Name",
+    smiles_column: str = "SMILES",
+) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    """Score all predicted protein-ligand complex PDB files against ground truth.
+
+    Iterates over ``predicted_structures``, skipping any molecule ID not found
+    in ``ground_truth_structures``. A ``coverage`` column (1.0 = matched,
+    0.0 = failed) is added before NaN values are replaced with worst-case
+    penalties so every compound contributes to bootstrap aggregation:
+
+    - LDDT-PLI, LDDT-LP (↑ better): NaN → 0.0
+    - BiSyRMSD (↓ better): NaN → ``BISYRMSD_NAN_PENALTY``
+
+    Poses that fail more than ``max_pb_failures`` PoseBusters checks are zeroed
+    before aggregation (LDDT-PLI=0, LDDT-LP=0, BiSyRMSD=``BISYRMSD_NAN_PENALTY``);
+    those compounds still count as covered (coverage=1.0) since OST scored them.
+
+    Args:
+        predicted_structures (dict[str, str]): Mapping from molecule ID to
+            filesystem path of the predicted PDB file.
+        ground_truth_structures (dict[str, str]): Mapping from molecule ID
+            to filesystem path of the reference PDB file.
+        max_pb_failures (int): Maximum number of PoseBusters checks a ligand
+            may fail before its scores are zeroed. Forwarded to
+            ``score_single_structure``. Defaults to ``POSEBUSTERS_MAX_FAILURES``.
+        smiles_map (pd.DataFrame | dict[str, str] | None): Ground-truth SMILES
+            for each molecule, forwarded to ``score_single_structure`` to build
+            an unambiguous ligand for OST's scorers and for bond-order
+            assignment before PoseBusters runs (see that function's
+            docstring). Either a DataFrame with an ``id_column`` and a
+            ``smiles_column`` (duplicate IDs keep their first SMILES), or an
+            already-built ``{molecule_id: smiles}`` dict. When ``None``, OST
+            guesses ligand connectivity from distance and PoseBusters leaves
+            bond orders as parsed from PDB (all single).
+        id_column (str): Column in ``smiles_map`` holding molecule IDs, used
+            only when ``smiles_map`` is a DataFrame. Defaults to
+            ``"Molecule_Name"``.
+        smiles_column (str): Column in ``smiles_map`` holding SMILES, used
+            only when ``smiles_map`` is a DataFrame. Defaults to ``"SMILES"``.
+
+    Returns:
+        tuple[pd.DataFrame, dict[str, list[str]]]: A pair of
+            (per_compound_df, pb_failures) where per_compound_df has columns
+            ``Molecule_Name``, ``LDDT-PLI``, ``BiSyRMSD``, ``LDDT-LP``,
+            ``coverage`` (1.0 if successfully matched, 0.0 otherwise), and
+            pb_failures maps molecule ID to the sorted list of PoseBusters
+            check names that caused its scores to be zeroed. Only compounds that
+            exceed ``max_pb_failures`` appear in pb_failures.
+
+    """
+    if isinstance(smiles_map, pd.DataFrame):
+        smiles_map = (
+            smiles_map[[id_column, smiles_column]]
+            .dropna(subset=[smiles_column])
+            .drop_duplicates(subset=[id_column])
+            .set_index(id_column)[smiles_column]
+            .to_dict()
+        )
+
+    logger.info(
+        "Scoring {} structure predictions against ground truth",
+        len(predicted_structures),
+    )
+    rows = []
+    pb_failures: dict[str, list[str]] = {}
+    for mol_id, model_path in predicted_structures.items():
+        if mol_id not in ground_truth_structures:
+            logger.warning("No ground truth found for {}, skipping.", mol_id)
+            continue
+        scores, failed_checks = score_single_structure(
+            model_path,
+            ground_truth_structures[mol_id],
+            max_pb_failures=max_pb_failures,
+            smiles=smiles_map.get(mol_id) if smiles_map is not None else None,
+        )
+        rows.append({"Molecule_Name": mol_id, **scores})
+        if failed_checks:
+            pb_failures[mol_id] = failed_checks
+
+    per_compound_df = pd.DataFrame(rows)
+    n_scored = int(per_compound_df["LDDT-PLI"].notna().sum())
+    logger.info(
+        "Successfully scored {}/{} structures.",
+        n_scored,
+        len(predicted_structures),
+    )
+
+    # Record coverage before filling so the per-compound parquet is transparent
+    per_compound_df["coverage"] = per_compound_df["LDDT-PLI"].notna().astype(float)
+
+    # Apply worst-case penalties so every compound contributes to the bootstrap mean
+    per_compound_df["LDDT-PLI"] = per_compound_df["LDDT-PLI"].fillna(0.0)
+    per_compound_df["LDDT-LP"] = per_compound_df["LDDT-LP"].fillna(0.0)
+    per_compound_df["BiSyRMSD"] = per_compound_df["BiSyRMSD"].fillna(
+        BISYRMSD_NAN_PENALTY
+    )
+
+    return per_compound_df, pb_failures
+
+
+def bootstrap_structure_metrics(
+    per_compound_df: pd.DataFrame,
+    n_bootstrap_samples: int,
+) -> pd.DataFrame:
+    """Bootstrap aggregate structure metrics over the set of scored compounds.
+
+    Each bootstrap iteration resamples the compounds (rows) with replacement
+    and computes the mean of each metric. Failed structures are already filled
+    with worst-case penalty values by ``score_structure_predictions``, so
+    ``np.mean`` is used — every compound contributes to the aggregate.
+    The returned DataFrame uses the same ``Sample`` / ``Endpoint`` schema as
+    ``bootstrap_metrics``, so ``average_bootstrap_results_by_endpoint`` can be
+    reused unchanged. Coverage is a scalar property of the whole submission and
+    is not bootstrapped — it is added to ``averaged_df`` separately in
+    ``score_structure_submission``.
+
+    Args:
+        per_compound_df (pd.DataFrame): Output of ``score_structure_predictions``
+            — one row per compound, columns ``LDDT-PLI``, ``BiSyRMSD``,
+            ``LDDT-LP``, ``coverage``.
+        n_bootstrap_samples (int): Number of bootstrap iterations.
+
+    Returns:
+        pd.DataFrame: Bootstrap results with columns:
+            ``Sample``, ``Endpoint``, ``LDDT-PLI``, ``BiSyRMSD``, ``LDDT-LP``.
+
+    """
+    _BOOTSTRAP_COLS = STRUCTURE_METRICS
+    scores = per_compound_df[_BOOTSTRAP_COLS].to_numpy()
+    n_compounds = scores.shape[0]
+
+    rows = []
+    for sample_idx, idx in enumerate(
+        bootstrap_sampling(n_compounds, n_bootstrap_samples)
+    ):
+        sample_means = np.mean(scores[idx], axis=0)
+        row: dict[str, object] = {"Sample": sample_idx, "Endpoint": "Structure"}
+        for col, value in zip(_BOOTSTRAP_COLS, sample_means):
+            row[col] = value
+        rows.append(row)
+
+    return pd.DataFrame(rows)

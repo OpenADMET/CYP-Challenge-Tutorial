@@ -17,6 +17,8 @@ dependencies:
   - datasets
   - scipy
   - loguru
+  - mdanalysis
+  - biotite
   - pip
   - pip:
       - git+https://github.com/PatWalters/useful_rdkit_utils.git@master
