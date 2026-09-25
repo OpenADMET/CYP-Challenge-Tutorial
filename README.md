@@ -3,7 +3,7 @@
 
 This repo provides starter notebooks and example workflows for the [**OpenADMET CYP Inhibition Blind Challenge**](https://huggingface.co/spaces/openadmet/cyp-challenge): A community benchmark for predicting **Cytochrome P450 (CYP) inhibition** across four major human isoforms: **CYP3A4, CYP2C9, CYP2D6, and CYP1A2**.
 
-CYP enzymes drive the metabolism of most marketed small-molecule drugs. Unexpected CYP inhibition can unexpected trigger drug–drug interactions (DDIs) by slowing the clearance of co-administered drugs. Furthermore, time-dependent (mechanism-based) inhibition (TDI) can cause DDIs that persist long after the parent compound has been cleared. This challenge asks participants to build predictive models that predicts both CYP direct inhibition, as well as TDI.
+CYP enzymes drive the metabolism of most marketed small-molecule drugs. Unexpected CYP inhibition can unexpected trigger drug–drug interactions (DDIs) by slowing the clearance of co-administered drugs. Furthermore, time-dependent (mechanism-based) inhibition (TDI) can cause DDIs that persist long after the parent compound has been cleared. This challenge asks participants to build predictive models that predicts CYP direct inhibition, TDI, and protein-ligand complex structure.
 
 For full challenge details and background, see the [challenge announcement](https://huggingface.co/spaces/openadmet/cyp-challenge).
 
@@ -39,6 +39,12 @@ The dataset covers a high-throughput dose-response curve (DRC) campaign across t
   - **Primary metric:** Matthews Correlation Coefficient (MCC).
   - **Target Isoforms:** Evaluated on CYP3A4 and CYP2D6 only (where TDI phenomena are clinically prominent).
   - **Label Definition:** Positive means the TDI-arm IC50 shift exceeds 2-fold relative to direct inhibition, including inferred positives among low-activity compounds where a shift can't be measured directly. 
+
+* **[Structure Prediction Track](./notebooks/structure_prediction.ipynb):** Predict the 3D structure of a **CYP3A4** protein-ligand complex given only the ligand SMILES. Our team at UCSF resolved 20 novel Cryo-EM structures of CYP3A4 complexed with a selection of assayed ligands (15 from the training set, 2 from the test set, and 3 additional compounds) — significantly expanding the chemical space beyond existing X-ray PDB structures. CYP3A4's remarkably flexible, heme-centered binding pocket, combined with the fact that similar ligands can adopt drastically distinct binding poses, makes it a notoriously hard target for computational structure prediction.
+
+  - **Submission:** A single `.zip` archive containing all 20 predicted complexes. Co-folding models, docking software, public PDB structures, or proprietary data are all fair game — feel free to draw inspiration from workflows that succeeded in our previous [PXR challenge](https://huggingface.co/spaces/openadmet/pxr-challenge).
+  - **Primary metric:** Local Distance Difference Test for Protein-Ligand Interactions (LDDT-PLI), scored automatically against the blinded ground truth via the OpenStructure pipeline. Secondary metrics include Binding-Site Superposed, Symmetry-Corrected Pose RMSD (BiSyRMSD).
+  - **Physical Plausibility Checks:** Every submitted structure is also run through [PoseBusters](https://pubs.rsc.org/sc/article/15/9/3130/827511/PoseBusters-AI-based-docking-methods-fail-to) chemical/geometric sanity checks. A structure that fails basic OpenStructure checks receives an LDDT-PLI score of 0 and a 20 Å BiSyRMSD penalty; a structure that fails PoseBusters receives an LDDT-PLI score of 0.
 
 ## 💬 Community
 
