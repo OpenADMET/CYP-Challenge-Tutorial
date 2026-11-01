@@ -72,3 +72,13 @@ CLASSIFICATION_METRICS = [
 SORT_REGRESSION_LEADERBOARD_BY = "ST-RAE"
 SORT_CLASSIFICATION_LEADERBOARD_BY = "MCC"
 BOOTSTRAP_SAMPLES = 1000
+
+# Structure dataset
+STRUCTURE_METRICS = ["LDDT-PLI", "BiSyRMSD", "LDDT-LP"]
+# Penalty applied to BiSyRMSD when OST cannot match the ligand (lower is better,
+# so a large value is used; 20 Å is well outside any reasonable binding-site RMSD)
+BISYRMSD_NAN_PENALTY: float = 20.0
+# Maximum number of PoseBusters ("dock" config) checks a predicted pose may fail.
+# A pose failing more than this has its scores zeroed (LDDT-PLI = LDDT-LP = 0,
+# BiSyRMSD = BISYRMSD_NAN_PENALTY). 0 means every check must pass.
+POSEBUSTERS_MAX_FAILURES: int = 0
